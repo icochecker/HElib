@@ -27,8 +27,11 @@ struct PtrVector {
   virtual T* operator[](long) const =0;
     // NOTE: the PtrVector is const, but the pointer T* is not
   virtual long size() const =0;
+
   virtual void resize(long newSize, const PtrVector* another=nullptr)
-  { throw(std::logic_error("Cannot resize a generic PtrVector")); }
+  { if (size()!=newSize)
+      throw(std::logic_error("Cannot resize a generic PtrVector"));
+  }
   virtual ~PtrVector(){}
 
   bool isSet(long i) const
@@ -225,12 +228,21 @@ struct PtrVector_slice : PtrVector<T> {
   const PtrVector<T>& orig;
   long start, sz;
   // Special case for a slice of a slice
-  PtrVector_slice(const PtrVector_slice<T>& _orig, long from, long _sz=-1)
-    : orig(_orig.orig), start(_orig.start +from), sz(_sz)
+  PtrVector_slice(const PtrVector_slice<T>& slice, long from, long _sz=-1)
+    : orig(slice.orig)
   {
-    if (start<0) start=0;
-    else if (start>_orig.orig.size()) start=_orig.orig.size();
-    if (sz<0 || sz>_orig.orig.size()-start) sz = _orig.orig.size()-start;
+    if (from<0) from=0;
+    if (_sz==0 || from >= slice.size()) { // empty slice
+      start=slice.orig.size();
+      sz = 0;
+      return;
+    }
+    // If we got here then 0 <= from < slice.size()
+    start = slice.start + from;
+
+    if (_sz<0 || from+_sz > slice.size()) // slice goes to end of slice
+      _sz = slice.size() - from;
+    sz = _sz;
   }
   // The general case: slice of a PtrVector
   PtrVector_slice(const PtrVector<T>& _orig, long from, long _sz=-1)

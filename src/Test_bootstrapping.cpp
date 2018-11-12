@@ -24,6 +24,7 @@ NTL_CLIENT
 #include "EncryptedArray.h"
 #include "EvalMap.h"
 #include "powerful.h"
+#include "matmul.h"
 
 static bool noPrint = false;
 
@@ -84,12 +85,12 @@ static long mValues[][14] = {
 };
 #define num_mValues (sizeof(mValues)/(14*sizeof(long)))
 
-#define OUTER_REP (3)
-#define INNER_REP (3)
+#define OUTER_REP (1)
+#define INNER_REP (1)
 
 static bool dry = false; // a dry-run flag
 
-void TestIt(long idx, long p, long r, long L, long c, long B, long skHwt, bool cons=false, int cacheType=0)
+void TestIt(long idx, long p, long r, long L, long c, long B, long skHwt, bool cons=false, int build_cache=0)
 {
   Vec<long> mvec;
   vector<long> gens;
@@ -135,7 +136,7 @@ void TestIt(long idx, long p, long r, long L, long c, long B, long skHwt, bool c
   //   bootstrappable (else the "powerful" basis is not initialized correctly.)
   //   This is a bug, the value 7 is sometimes the right one, but seriously??
 
-  context.makeBootstrappable(mvec, /*t=*/0, cons, cacheType);
+  context.makeBootstrappable(mvec, /*t=*/0, cons, build_cache);
   t += GetTime();
 
   if (skHwt>0) context.rcData.skHwt = skHwt;
@@ -255,7 +256,7 @@ int main(int argc, char *argv[])
   long nthreads=1;
 
   long seed=0;
-  long useCache=0;
+  long useCache=1;
 
   amap.arg("p", p, "plaintext base");
 
@@ -272,7 +273,11 @@ int main(int argc, char *argv[])
   amap.arg("nthreads", nthreads, "number of threads");
   amap.arg("seed", seed, "random number seed");
   amap.arg("noPrint", noPrint, "suppress printouts");
-  amap.arg("useCache", useCache, "0: no cache, 1:zzX, 2:DCRT");
+  amap.arg("useCache", useCache, "0: zzX cache, 1: DCRT cache");
+
+
+  amap.arg("force_bsgs", fhe_test_force_bsgs);
+  amap.arg("force_hoist", fhe_test_force_hoist);
 
   amap.parse(argc, argv);
 

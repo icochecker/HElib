@@ -54,18 +54,49 @@ private:
   const EncryptedArray& ea;
   bool invert;   // apply transformation in inverser order?
   long nfactors; // how many factors of m
-  std::unique_ptr<MatMulBase>            mat1;   // one block matrix
-  NTL::Vec<std::unique_ptr<MatMulBase> > matvec; // regular matrices
+  std::unique_ptr<BlockMatMul1DExec>       mat1;   // one block matrix
+  NTL::Vec<std::unique_ptr<MatMul1DExec>>  matvec; // regular matrices
 
 public:
-  EvalMap(const EncryptedArray& _ea, const Vec<long>& mvec, bool _invert,
+  EvalMap(const EncryptedArray& _ea, 
+          bool minimal, 
+          const Vec<long>& mvec, 
+          bool _invert,
+          bool build_cache,
           bool normal_basis = true);
 
   // the normal_basis parameter indicates that we want the
   // normal basis transformation when invert == true.
   // On by default, off for testing
 
-  void buildCache(MatrixCacheType cType);
+  void upgrade();
+  void apply(Ctxt& ctxt) const;
+};
+
+
+//! @class ThinEvalMap
+//! @brief Class that provides the functionality for the
+//! linear transforms used in "thin" boostrapping,
+//! where slots are assumed to contain constants.
+//! The interface is exactly the same as for EvalMap,
+//! except that the constructor does not have a normal_basis
+//! parameter.
+
+class ThinEvalMap {
+private:
+  const EncryptedArray& ea;
+  bool invert;   // apply transformation in inverser order?
+  long nfactors; // how many factors of m
+  NTL::Vec<std::unique_ptr<MatMulExecBase>>  matvec; // regular matrices
+
+public:
+  ThinEvalMap(const EncryptedArray& _ea, 
+          bool minimal, 
+          const Vec<long>& mvec, 
+          bool _invert,
+          bool build_cache);
+
+  void upgrade();
   void apply(Ctxt& ctxt) const;
 };
 

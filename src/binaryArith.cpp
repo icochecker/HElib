@@ -9,8 +9,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License. See accompanying LICENSE file.
  */
-/* binaryArith.cpp
- * Implementing integer addition and multiplication in binary representation.
+/**
+ * @file binaryArith.cpp
+ * @brief Implementing integer addition, multiplication in binary representation
  */
 #include <numeric>
 #include <climits>
@@ -94,6 +95,7 @@ public:
  * consuming as few levels as possible).
  **/
 class AddDAG {
+  std::mutex scratch_mtx;  // controls access to scratch vector
   std::vector<ScratchCell> scratch; // scratch space for ciphertexts
   std::map<NodeIdx,DAGnode> p; // p[i,j]= prod_{t=j}^i (a[t]+b[t])
   std::map<NodeIdx,DAGnode> q; // q[i,j]= a[j]b[j]*prod_{t=j+1}^i (a[t]+b[t])
@@ -277,12 +279,16 @@ void AddDAG::apply(CtPtrs& sum,
   if (aSize != lsize(a) || bSize != lsize(b))
     throw std::logic_error("DAG applied to wrong vectors");
 
-  if (sizeLimit==0) sizeLimit = bSize+1;
-  sum.resize(sizeLimit, &b); // allocate space for the output
+  if (sizeLimit==0)
+    sizeLimit = bSize+1;
+  if (lsize(sum)!=sizeLimit)
+    sum.resize(sizeLimit, &b); // allocate space for the output
+  for (long i=0; i<lsize(sum); i++)
+    sum[i]->clear();
 
   // Allow multi-threading in this loop
   NTL_EXEC_RANGE(sizeLimit, first, last)
-  for (long i=first; i<last; i++) {
+  for (long i=first; i<last; i++) { //  for (long i=0; i<sizeLimit; i++) {
     if (i<bSize)
       addCtxtFromNode(*(sum[i]), this->findP(i,i), a, b);
     for (long j=std::min(i-1, aSize-1); j>=0; --j) {
@@ -369,7 +375,7 @@ const Ctxt& AddDAG::getCtxt(DAGnode* node,
 Ctxt* AddDAG::allocateCtxtLike(const Ctxt& c)
 {
   // look for an unused cell in the scratch array
-  for (long i=0; i<(long)scratch.size(); i++)
+  for (long i=0; i<lsize(scratch); i++)
     if (scratch[i].used == false) { // found a free one, try to use it
       bool used = scratch[i].used.exchange(true); // mark it as used
       if (used==false)     // make sure no other thread got there first
@@ -379,8 +385,9 @@ Ctxt* AddDAG::allocateCtxtLike(const Ctxt& c)
   // If not found, allocate a new cell
   ScratchCell sc(c);      // cell points to new ctxt, with used=true
   Ctxt* pt = sc.ct.get(); // remember the raw pointer
-  scratch.push_back(std::move(sc));  // scratch now owns the pointer
-  return pt;         // return the raw pointer
+  std::unique_lock<std::mutex> lck(scratch_mtx);   // protect scratch vector
+  scratch.emplace_back(std::move(sc));  // scratch now owns the pointer
+  return pt;              // return the raw pointer
 }
 
 // Mark a scratch ciphertext as unused. We assume that no two nodes
@@ -400,8 +407,8 @@ void AddDAG::markAsAvailable(DAGnode* node)
 /********************************************************************/
 
 // Use packed bootstrapping, so we can bootstrap all in just one go.
-static void packedRecrypt(const CtPtrs& a, const CtPtrs& b,
-                          std::vector<zzX>* unpackSlotEncoding)
+void packedRecrypt(const CtPtrs& a, const CtPtrs& b,
+                   std::vector<zzX>* unpackSlotEncoding)
 {
   const Ctxt* ct = b.ptr2nonNull(); // find some non-null Ctxt
   if (ct==nullptr) ct = a.ptr2nonNull();
@@ -433,6 +440,10 @@ void addTwoNumbers(CtPtrs& sum, const CtPtrs& a, const CtPtrs& b,
   // Work out the order of multiplications to compute all the carry bits
   AddDAG addPlan(a,b);
 
+#ifdef DEBUG_PRINTOUT // print plan
+  addPlan.printAddDAG();
+#endif
+
   // Ensure that we have enough levels to compute everything,
   // bootstrap otherwise
   if (addPlan.lowLvl()<1) {
@@ -442,16 +453,7 @@ void addTwoNumbers(CtPtrs& sum, const CtPtrs& a, const CtPtrs& b,
       throw std::logic_error("not enough levels for addition DAG");
     }
   }
-#ifdef DEBUG_PRINTOUT // print level before and after
-  long lvl = findMinLevel({&a, &b});
-  cout << " addTwoNumbers: level before addition="<<lvl
-       << ", planned output level="<<addPlan.lowLvl()<<endl;
-#endif
   addPlan.apply(sum, a, b, sizeLimit);    // perform the actual addition
-#ifdef DEBUG_PRINTOUT // print level before and after
-  cout << " after computing a "<<sum.size()<<"-bit sum, level="
-       << findMinLevel(sum) << endl;
-#endif
 }
 
 // Return pointers to the three inputs, ordered by size
@@ -552,8 +554,8 @@ static void three4Two(CtPtrs& lsb, CtPtrs& msb,
   std::tie(p1,p2,p3) = orderBySize(u,v,w); // size(p3)>=size(p2)>=size(p1)
 
   if (p3->size() <= 0) { // empty input
-    lsb.resize(0);
-    msb.resize(0);
+    setLengthZero(lsb);
+    setLengthZero(msb);
     return;
   }
   if (p1->size()<=0) { // two or less inputs
@@ -578,30 +580,37 @@ static void three4Two(CtPtrs& lsb, CtPtrs& msb,
   resize(tmpLsb, lsbSize, Ctxt(ZeroCtxtLike,*ctptr));
   resize(tmpMsb, msbSize, Ctxt(ZeroCtxtLike,*ctptr));
 
-  for (long i=0; i<std::min(lsize(*p1),lsbSize); i++)
-    if (i<lsize(tmpMsb)-1)
+  NTL_EXEC_RANGE(msbSize-1, first, last)
+  for (long i=first; i<last; i++) {
+    if (i<lsize(*p1))
       three4Two(&tmpLsb[i], &tmpMsb[i+1], (*p1)[i], (*p2)[i], (*p3)[i]);
-    else {
-      if (p1->isSet(i)) tmpLsb[i] =  *((*p1)[i]);
-      if (p2->isSet(i)) tmpLsb[i] += *((*p2)[i]);
-      if (p3->isSet(i)) tmpLsb[i] += *((*p3)[i]);
+    else if (i<lsize(*p2)) {
+      three4Two(&tmpLsb[i], &tmpMsb[i+1], (*p2)[i], (*p3)[i], nullptr);
     }
-
-  for (long i=p1->size(); i<std::min(lsize(*p2),lsbSize); i++) {
-    if (p2->isSet(i)) tmpLsb[i] =  *((*p2)[i]);
-    if (p3->isSet(i)) tmpLsb[i] += *((*p3)[i]);
-    if (i<lsize(tmpMsb)-1 && p2->isSet(i) && p3->isSet(i)) {
-      tmpMsb[i+1] = *((*p2)[i]);
-      tmpMsb[i+1].multiplyBy(*((*p3)[i]));
-    }
+    else if (p3->isSet(i)) tmpLsb[i] = *((*p3)[i]);
   }
-  for (long i=p2->size(); i<std::min(lsize(*p3),lsbSize); i++)
-    if (p3->isSet(i)) tmpLsb[i] = *((*p3)[i]);
+  NTL_EXEC_RANGE_END
 
+  if (msbSize==lsbSize) { // we only computed upto lsbSize-1, do the last LSB
+    if (p1->isSet(lsbSize-1)) tmpLsb[lsbSize-1] =  *((*p1)[lsbSize-1]);
+    if (p2->isSet(lsbSize-1)) tmpLsb[lsbSize-1] += *((*p2)[lsbSize-1]);
+    if (p3->isSet(lsbSize-1)) tmpLsb[lsbSize-1] += *((*p3)[lsbSize-1]);
+  }
   vecCopy(lsb, tmpLsb);
   vecCopy(msb, tmpMsb);
 }
 
+//! @brief An implementation of PtrMatrix using vector< PtrVector<T>* >
+template<typename T>
+struct PtrMatrix_PtPtrVector : PtrMatrix<T> {
+  std::vector< PtrVector<T>* >& rows;
+  PtrMatrix_PtPtrVector(std::vector< PtrVector<T>* >& mat): rows(mat) {}
+  PtrVector<T>& operator[](long i) override             // returns a row
+  { return *rows[i]; }
+  const PtrVector<T>& operator[](long i) const override // returns a row
+  { return *rows[i]; }
+  long size() const override { return lsize(rows); }    // How many rows
+};
 
 // Calculates the sum of many numbers using the 3-for-2 method
 void addManyNumbers(CtPtrs& sum, CtPtrMat& numbers, long sizeLimit,
@@ -619,37 +628,47 @@ void addManyNumbers(CtPtrs& sum, CtPtrMat& numbers, long sizeLimit,
   }
   if (lsize(numbers)==1) { vecCopy(sum, numbers[0]); return; }
 
-  // if just 2 numbers to add then use normal binary addition
-  // else enter loop below. We view numbers as a FIFO queue, each
-  // time removing the first three entries at the head and adding
-  // two new ones at the tail.
-  long head=0, tail=0;
-  for (long leftInQ=lsize(numbers); leftInQ>2; leftInQ--) {
-    long h2 = (head+1) % lsize(numbers);
-    long h3 = (head+2) % lsize(numbers);
-    long t2 = (tail+1) % lsize(numbers);
-    const CtPtrs& h1ct = numbers[head];
-    const CtPtrs& h2ct = numbers[h2];
-    const CtPtrs& h3ct = numbers[h3];
+  bool bootstrappable = ct_ptr->getPubKey().isBootstrappable();
+  const EncryptedArray& ea = *(ct_ptr->getContext().ea);
 
-    // If any of head,h1,h2 are too low level, then bootstrap everything
-    if (findMinLevel({&h1ct, &h2ct, &h3ct}) < 3) {
-      assert(unpackSlotEncoding!=nullptr
-             && ct_ptr->getPubKey().isBootstrappable());
-      packedRecrypt(numbers, *unpackSlotEncoding,
-                    *(ct_ptr->getContext().ea), /*belowLvl=*/10);
+  long leftInQ = lsize(numbers);
+  std::vector<CtPtrs*> numPtrs(leftInQ);
+  for (long i=0; i<leftInQ; i++) numPtrs[i] = &(numbers[i]);
+
+  // use 3-for-2 repeatedly until only two numbers are leff to add
+  while (leftInQ>2) {
+    // If any number is too low level, then bootstrap everything
+    PtrMatrix_PtPtrVector<Ctxt> wrapper(numPtrs);
+    if (findMinLevel(wrapper)<3) {
+      assert(bootstrappable && unpackSlotEncoding!=nullptr);
+      packedRecrypt(wrapper, *unpackSlotEncoding, ea, /*belowLvl=*/10);
     }
+    // Prepare a vector for pointers to the output of this iteration
+    long nTriples = leftInQ/3;
+    long leftOver = leftInQ - (3*nTriples);
+    std::vector<CtPtrs*> numPtrs2(2*nTriples +leftOver);
 
-    // three4Two can work in-place
-    three4Two(numbers[tail], numbers[t2], h1ct, h2ct, h3ct, sizeLimit);
+    if (leftOver>0) { // copy the leftover pointers
+      numPtrs2[0] = numPtrs[3*nTriples];
+      if (leftOver>1) numPtrs2[1] = numPtrs[3*nTriples +1];
+    }
+    // Allow multi-threading in this loop
+    //    NTL_EXEC_RANGE(nTriples, first, last)
+    //    for (long i=first; i<last; i++) {   // call the three-for-two procedure
+    for (long i=0; i<nTriples; i++) {   // call the three-for-two procedure
+      three4Two(*numPtrs[3*i], *numPtrs[3*i+1], // three4Two works in-place
+                *numPtrs[3*i], *numPtrs[3*i+1], *numPtrs[3*i+2], sizeLimit);
 
-    head = (head+3) % lsize(numbers);    
-    tail = (tail+2) % lsize(numbers);
+      numPtrs2[leftOver +2*i]    = numPtrs[3*i]; // copy the output pointers
+      numPtrs2[leftOver +2*i +1] = numPtrs[3*i +1];
+    }
+    //    NTL_EXEC_RANGE_END
+    numPtrs.swap(numPtrs2);   // swap input/output vectors
+    leftInQ = lsize(numPtrs); // update the size
   }
   // final addition
-  long h2 = (head+1) % lsize(numbers);
-  addTwoNumbers(sum, numbers[head], numbers[h2], sizeLimit, unpackSlotEncoding);
-} // NOTE: It'd be a little challenging to parallelize this
+  addTwoNumbers(sum, *numPtrs[0], *numPtrs[1], sizeLimit, unpackSlotEncoding);
+}
 
 
 // Multiply a positive a by a potentially negative b, we need to sign-extend b
@@ -661,18 +680,31 @@ static void multByNegative(CtPtrs& product, const CtPtrs& a, const CtPtrs& b,
   if (sizeLimit>0 && sizeLimit<resSize) resSize=sizeLimit;
 
   NTL::Vec< NTL::Vec<Ctxt> > numbers(INIT_SIZE, std::min(lsize(a),resSize));
-  for (long i=0; i<lsize(numbers); i++) {
+  long nNums = lsize(numbers);
+  for (long i=0; i<nNums; i++)
     numbers[i].SetLength(resSize, Ctxt(ZeroCtxtLike,*(a[0])));
-    for (long j=i; j<resSize; j++)
-      if (j<i+lsize(b)) {
-        if (b.isSet(j-i) && !b[j-i]->isEmpty()
-            && a.isSet(i) && !a[i]->isEmpty()) {
-          numbers[i][j] = *(b[j-i]);
-          numbers[i][j].multiplyBy(*(a[i]));   // multiply by the bit of a
-        }
-      }
-      else numbers[i][j] = numbers[i][i+lsize(b)-1]; // sign extension
+
+  std::vector<std::pair<long,long> > pairs;
+  for (long i=0; i<nNums; i++) for (long j=i; j<resSize; j++)
+    if (j<i+lsize(b) && a.isSet(i)  && !a[i]->isEmpty()
+                     && b.isSet(j-i)&& !b[j-i]->isEmpty()) {
+      pairs.push_back(std::pair<long,long>(i,j));
+    }
+  long nPairs = lsize(pairs);
+
+  NTL_EXEC_RANGE(nPairs, first, last)
+  for (long idx=first; idx<last; idx++) {
+    long i,j; std::tie(i,j) = pairs[idx];
+    numbers[i][j] = *(b[j-i]);
+    numbers[i][j].multiplyBy(*(a[i]));   // multiply by the bit of a
   }
+  NTL_EXEC_RANGE_END
+
+  // sign extension
+  for (long i=0; i<nNums; i++) for (long j=i+lsize(b); j<resSize; j++) {
+      numbers[i][j] = numbers[i][i+lsize(b)-1]; // sign extension
+    }
+
   CtPtrMat_VecCt nums(numbers); // Wrapper around numbers
 #ifdef DEBUG_PRINTOUT
   long pa, pb;
@@ -699,7 +731,7 @@ void multTwoNumbers(CtPtrs& product, const CtPtrs& a, const CtPtrs& b,
   if (sizeLimit>0 && sizeLimit<resSize) resSize=sizeLimit;
 
   if (a.numNonNull()<1 || b.numNonNull()<1) {
-    product.resize(0);
+    setLengthZero(product);
     return; // return 0
   }
 
@@ -710,7 +742,7 @@ void multTwoNumbers(CtPtrs& product, const CtPtrs& a, const CtPtrs& b,
   // Edge case, if a or b is 1 bit
   if (aSize==1) {
     if (a[0]->isEmpty()) {
-      product.resize(0);
+      setLengthZero(product);
       return;
     }
     vecCopy(product,b,resSize);
@@ -724,7 +756,7 @@ void multTwoNumbers(CtPtrs& product, const CtPtrs& a, const CtPtrs& b,
   }
   if (bSize==1) {
     if (b[0]->isEmpty()) {
-      product.resize(0);
+      setLengthZero(product);
       return;
     }
     vecCopy(product,a,resSize);
@@ -742,17 +774,24 @@ void multTwoNumbers(CtPtrs& product, const CtPtrs& a, const CtPtrs& b,
 
   NTL::Vec< NTL::Vec<Ctxt> > numbers(INIT_SIZE, std::min(lsize(b),resSize));
   const Ctxt* ct_ptr = a.ptr2nonNull();
-  for (long i=0; i<lsize(numbers); i++) {
+  long nNums = lsize(numbers);
+  for (long i=0; i<nNums; i++)
     numbers[i].SetLength(std::min((i+aSize),resSize),
                          Ctxt( ZeroCtxtLike,*ct_ptr ) );
-    for (long j=i; j<lsize(numbers[i]); j++) {
-      if (a.isSet(j-i) && !(a[j-i]->isEmpty())
-          &&  b.isSet(i) && !(b[i]->isEmpty()) ) {
-        numbers[i][j] = *(a[j-i]);
-        numbers[i][j].multiplyBy(*(b[i])); // multiply by the bit of b
-      }
-    }
+  std::vector<std::pair<long,long> > pairs;
+  for (long i=0; i<nNums; i++) for (long j=i; j<lsize(numbers[i]); j++) {
+    if (a.isSet(j-i)&& !(a[j-i]->isEmpty())&& b.isSet(i)&& !(b[i]->isEmpty()))
+      pairs.push_back(std::pair<long,long>(i,j));
   }
+  long nPairs = lsize(pairs);
+  NTL_EXEC_RANGE(nPairs, first, last)
+  for (long idx=first; idx<last; idx++) {
+    long i,j; std::tie(i,j) = pairs[idx];
+    numbers[i][j] = *(a[j-i]);
+    numbers[i][j].multiplyBy(*(b[i])); // multiply by the bit of b
+  }
+  NTL_EXEC_RANGE_END
+
   CtPtrMat_VecCt nums(numbers); // A wrapper aroune numbers
 #ifdef DEBUG_PRINTOUT
   long pa, pb;
@@ -854,37 +893,64 @@ static void fifteen4Four(const CtPtrs& out, const CtPtrs& in, long sizeLimit)
   Ctxt& d2=b7;  Ctxt& d3=b9;  Ctxt& d4=f2;
   Ctxt& e2=c1;  Ctxt& e3=c2;  Ctxt& e4=f2;
 
-  three4Two(&b1,&b2,in[0],in[1],in[2]); // b2 b1 = 3for2(in[0..2])
-  three4Two(&b3,&b4,in[3],in[4],in[5]); // b4 b3 = 3for2(in[3..5])
-  three4Two(&b5,&b6,in[6],in[7],in[8]); // b6 b5 = 3for2(in[6..8])
+  long nThreads = std::min(NTL::AvailableThreads(), 3L);
+  NTL_EXEC_INDEX(nThreads, index)     // run these three lines in parallel
+  switch (index) {
+  case 0: three4Two(&b1,&b2,in[0],in[1],in[2]); // b2 b1 = 3for2(in[0..2])
+    if (nThreads>1) break;
+  case 1: three4Two(&b3,&b4,in[3],in[4],in[5]); // b4 b3 = 3for2(in[3..5])
+    if (nThreads>2) break;
+  default: three4Two(&b5,&b6,in[6],in[7],in[8]);// b6 b5 = 3for2(in[6..8])
+  }
+  NTL_EXEC_INDEX_END
 
-  three4Two(c1,c2, b1, b3, b5);        // c2 c1 = 3for2(b1,b3,b5)
+  three4Two(c1,c2, b1, b3, b5);         // c2 c1 = 3for2(b1,b3,b5)
 
-  three4Two(c3,c4, b2, b4, b6);          // c4 c3 = 3for2(b2,b4,b6)
+  three4Two(c3,c4, b2, b4, b6);         // c4 c3 = 3for2(b2,b4,b6)
 
-  three4Two(&b7,&b8,in[9],in[10],in[11]);  // b8 b7 = 3for2(in[9..11])
-  three4Two(&b9,&b10,in[12],in[13],in[14]);// b10 b9 = 3for2(in[12..14])
+  nThreads = std::min(NTL::AvailableThreads(), 2L);
+  NTL_EXEC_INDEX(nThreads, index)       // run these two lines in parallel
+  switch (index) {
+  case 0: three4Two(&b7,&b8,in[9],in[10],in[11]);   // b8 b7 = 3for2(in[9..11])
+    if (nThreads>1) break;
+  default: three4Two(&b9,&b10,in[12],in[13],in[14]);// b10 b9 = 3for2(in[12..14])
+  }
+  NTL_EXEC_INDEX_END
 
-  three4Two(d1,d2, b7, b9, c1);        // d2 d1 = 3for2(b7,b9,c1)
+  NTL_EXEC_INDEX(nThreads, index)       // run these two lines in parallel
+  switch (index) {
+  case 0: three4Two(d1,d2, b7, b9, c1); // d2 d1 = 3for2(b7,b9,c1)
+    if (nThreads>1) break;
+  default: if (sizeLimit >= 2)
+      three4Two(d3,d4, b8, b10, c2);    // d4 d3 = 3for2(b8,b10,c2)
+  }
+  NTL_EXEC_INDEX_END
   if (sizeLimit < 2) return;
-  three4Two(d3,d4, b8, b10, c2);       // d4 d3 = 3for2(b8,b10,c2)
 
-  three4Two(e1,e2, c3, d2, d3);        // e2 e1 = 3for2(c3,d2,d3)
+  NTL_EXEC_INDEX(nThreads, index)       // run these two blocks in parallel
+  switch (index) {
+  case 0: three4Two(e1,e2, c3, d2, d3); // e2 e1 = 3for2(c3,d2,d3)
+    if (nThreads>1) break;
+  default: if (sizeLimit >= 3) {
+      e3 = c4;
+      e3 += d4;                         // e3 = c4 ^ d4
+      e4.multiplyBy(c4);                // e4 = c4 * d4 (e4 alias d4)
+    }
+  }
+  NTL_EXEC_INDEX_END
   if (sizeLimit < 3) return;
-  e3 = c4;
-  e3 += d4;                            // e3 = c4 ^ d4
-  e4.multiplyBy(c4);                   // e4 = c4 * d4 (e4 alias d4)
 
   f1 = e2;
-  f1 += e3;                            // f1 = e2 ^ e3
+  f1 += e3;                             // f1 = e2 ^ e3
   if (sizeLimit < 4) return;
   e2.multiplyBy(e3);
-  f2 += e2;                            // f2 = e4^(e2*e3)  (f2 alias e4)
+  f2 += e2;                             // f2 = e4^(e2*e3)  (f2 alias e4)
 }
 // Same as above, but some of the pointers may be null.
 // Returns number of output bits that are not identically zero.
 long fifteenOrLess4Four(const CtPtrs& out, const CtPtrs& in, long sizeLimit)
 {
+  FHE_TIMER_START;
   long numNonNull = in.numNonNull();
   if (numNonNull>7) {
     fifteen4Four(out, in, sizeLimit);
